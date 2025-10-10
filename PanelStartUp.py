@@ -1,9 +1,9 @@
-import adsk.core, adsk.fusion, math, re, subprocess, os, time, webbrowser, traceback
+import adsk.core, adsk.fusion, math, re, subprocess, os, time, webbrowser, json, traceback
 
 # TODO: Create a way to determine if the panel has foam without relying on the the 3.0" foam model as it may not always be available. To charles or not?
 # TODO: Create test to find errors in sheathing compared to the frame.
 # TODO: Create script to automate cutting the "L" shape notches in the back of the sheathing.
-# TODO: Add logic to account for bumps.
+# TODO: Identify foam under windows and if so add tool path for window bevel.
 
 # Array to display all warning messages at the end of the script.  
 report_message = []
@@ -17,13 +17,9 @@ def run(context):
     product = app.activeProduct
     design = adsk.fusion.Design.cast(product)
     rootComp = design.rootComponent
-
-    # Prompt the user to select the front face.
-    global selection
-    selection = ui.selectEntity('Select a face to be the new front view.', 'Faces')
-
+    
     # list of functions 
-    rotateBodiesToFont()    # Rotates the bodies around the Z axis so the front of the panel is the front view.
+    rotateBodiesToFront()    # Rotates the bodies around the Z axis so the front of the panel is the front view.
     moveBodiesToOrgin()     # Moves all bodies to the origin.
     stockBody()             # Create a stock body for Charles setup.
     changeUnits()           # Change units to inches.
@@ -42,93 +38,91 @@ def run(context):
     thinFoam()              # Checks for thin foam and adjusts the facemill cutting height along with Brick Feature EM and FM cutting heights if they exist.
     foamErrorDetection()    # Compare Foam and Sheathing X, Y, and Z dimensions to find errors from Revit export.
     showAllMessages()       # Displays a summary at the end of the script.
-    
-def rotateBodiesToFont():
+
+def addMessage(msg):        # This function adds messages throughout the script to give a summary at the end.
     try:
-        # Check if a selection was made. If the user cancels, the selection object is None.
+        report_message.append(f"\u2022 {msg}\n")
+    except:
+        ui.messageBox(f"addMessage(): failed:\n{traceback.format_exc()}")
+
+def in_cm(x):               # This function converts inches to cm.
+    return x * 2.54
+
+def rotateBodiesToFront():
+    try:
+        # Ask the user to select a face
+        selection = ui.selectEntity('Select a face to be the new front view.', 'Faces')
         if not selection:
-            ui.messageBox('No face was selected. The script will now exit.')
+            ui.messageBox("No face selected. Script stopped.")
             return
 
-        # Get the selected face directly from the selection object.
-        selected_face = selection.entity
-        
-        # Ensure the selected entity is a BRepFace.
-        if not isinstance(selected_face, adsk.fusion.BRepFace):
-            ui.messageBox('Please select a valid BRepFace.')
+        face = selection.entity
+        if not isinstance(face, adsk.fusion.BRepFace):
+            ui.messageBox("Selected entity is not a valid BRepFace. Script stopped.")
             return
 
-        # Get the normal vector of the selected face in the global coordinate system.
-        face_evaluator = selected_face.evaluator
-        
-        # Use the centroid of the face as a point to get the normal.
-        point_on_face = selected_face.centroid
-        
-        success, face_normal = face_evaluator.getNormalAtPoint(point_on_face)
-        
+        # Get the normal vector of the face at its centroid
+        success, current_normal = face.evaluator.getNormalAtPoint(face.centroid)
         if not success:
-            ui.messageBox('Could not get the normal vector for the selected face. The script will now exit.')
+            ui.messageBox("Failed to get face normal. Script stopped.")
             return
-            
-        face_normal.normalize()
+        current_normal.normalize()
 
-        # This script only works for faces with normals parallel to the XY plane.
-        if abs(face_normal.z) > 1e-6:
-            ui.messageBox('This script only supports faces with normals parallel to the XY plane. Please select a different face.')
-            return
-        
-        # Define the target vector for the new front view (negative Y-axis).
-        target_front_vector = adsk.core.Vector3D.create(0, -1, 0)
+        # Define target normal (global negative Y)
+        target_normal = adsk.core.Vector3D.create(0, -1, 0)
 
-        # Use the atan2 function to get the signed angle from the X-axis to the face normal.
-        angle_rad_face = math.atan2(face_normal.y, face_normal.x)
-        
-        # The angle of the target negative Y-axis is -pi/2.
-        angle_rad_target = -math.pi / 2
-        
-        # The required rotation is the difference between the target and face angles.
-        angle_to_rotate = angle_rad_target - angle_rad_face
+        # Compute rotation axis (perpendicular to both)
+        rotation_axis = current_normal.crossProduct(target_normal)
 
-        # Get the bounding box of the entire design's root component.
-        bounding_box = rootComp.boundingBox
-        # Calculate the center of the bounding box to use as the rotation origin.
-        center_x = (bounding_box.minPoint.x + bounding_box.maxPoint.x) / 2.0
-        center_y = (bounding_box.minPoint.y + bounding_box.maxPoint.y) / 2.0
-        center_z = (bounding_box.minPoint.z + bounding_box.maxPoint.z) / 2.0
-        rotation_origin = adsk.core.Point3D.create(center_x, center_y, center_z)
-
-        # Create the transformation matrix with the calculated angle, Z-axis, and rotation origin.
-        final_transform = adsk.core.Matrix3D.create()
-        z_axis = adsk.core.Vector3D.create(0, 0, 1)
-        final_transform.setToRotation(angle_to_rotate, z_axis, rotation_origin)
-
-        # Get the MoveFeatures collection from the root component.
-        moveFeatures = rootComp.features.moveFeatures
-
-        # Create an ObjectCollection to hold ALL bodies to be moved.
-        bodiesToMove = adsk.core.ObjectCollection.create()
-        for body in rootComp.bRepBodies:
-            bodiesToMove.add(body)
-            
-
-        if bodiesToMove.count > 0:
-            # Create a move input with all bodies and the final transformation matrix.
-            moveInput = moveFeatures.createInput(bodiesToMove, final_transform)
-
-            # Add the move feature to the design.
-            moveFeatures.add(moveInput)
+        # Check for edge cases: already aligned or exactly opposite
+        if rotation_axis.length < 1e-6:
+            dot = current_normal.dotProduct(target_normal)
+            if dot > 0:
+                ui.messageBox("Face is already aligned with target. No rotation needed.")
+                return
+            else:
+                # Opposite direction: rotate 180 degrees around global Z
+                rotation_axis = adsk.core.Vector3D.create(0, 0, 1)
+                angle = math.pi
         else:
-            ui.messageBox('No bodies found in the root component to move.')
+            rotation_axis.normalize()
+            # Rotation angle
+            dot = max(-1.0, min(1.0, current_normal.dotProduct(target_normal)))
+            angle = math.acos(dot)
+
+        # Compute rotation origin (center of the root component)
+        bbox = rootComp.boundingBox
+        rotation_origin = adsk.core.Point3D.create(
+            (bbox.minPoint.x + bbox.maxPoint.x) / 2.0,
+            (bbox.minPoint.y + bbox.maxPoint.y) / 2.0,
+            (bbox.minPoint.z + bbox.maxPoint.z) / 2.0
+        )
+
+        # Create transformation matrix
+        transform = adsk.core.Matrix3D.create()
+        transform.setToRotation(angle, rotation_axis, rotation_origin)
+
+        # Collect all bodies to move
+        bodies = adsk.core.ObjectCollection.create()
+        for body in rootComp.bRepBodies:
+            bodies.add(body)
+        if bodies.count == 0:
+            ui.messageBox("No bodies found in root component. Script stopped.")
             return
 
-        # Set the active camera to the new front view to refresh the viewport.
-        # The new "front" view is now aligned with the negative Y-axis.
+        # Apply the move
+        move_input = rootComp.features.moveFeatures.createInput(bodies, transform)
+        rootComp.features.moveFeatures.add(move_input)
+
+        # Optional: reset the camera to front view
         camera = app.activeViewport.camera
+        camera.upVector = adsk.core.Vector3D.create(0, 0, 1)   # Z is up
         camera.viewOrientation = adsk.core.ViewOrientations.FrontViewOrientation
         app.activeViewport.camera = camera
-        app.activeViewport.fit() # Fit the view to the new position of the assembly
+        app.activeViewport.fit()
+
     except:
-        ui.messageBox(f"rotateBodiesToFont(): failed:\n{traceback.format_exc()}")
+        ui.messageBox(f"rotateBodiesToFront() failed:\n{traceback.format_exc()}")
 
 def moveBodiesToOrgin():
     try:
@@ -230,28 +224,38 @@ def changeUnits():
 
 def identifyFoam():
     try:
-        foam_dim_in = 3.0
-        foam_dim_cm = foam_dim_in * 2.54
-        tolerance_cm = .001 * 2.54      
-        foam_bodies = [] 
+        foam_dim = in_cm(3.0) 
+        tolerance = in_cm(.001)    
+        foam_bodies = []
+
+        # Look for body that is 3" thick 
+        global foamresult
+        foamresult = False
         
         # Iterate through all bodies in the root component.
         for body in rootComp.bRepBodies:
             boundingBox = body.boundingBox
             width = boundingBox.maxPoint.y - boundingBox.minPoint.y
             
-            if (abs(width - foam_dim_cm) < tolerance_cm):
+            if (abs(width - foam_dim) < tolerance):
                 # Add the body to the list and rename it
                 foam_bodies.append(body)
                 body.name = "Foam"
+
+        # Checks for body named "Foam"        
+        if any("Foam" in body.name for body in rootComp.bRepBodies):
+            foamresult = True
     except:
         ui.messageBox(f"identifyFoam(): failed:\n{traceback.format_exc()}")
 
 def identifyBump():
-    try:    
-        bump_track_dim_in = 6.086
-        bump_track_dim_cm = bump_track_dim_in * 2.54
-        tolerance_cm = .001 * 2.54    
+    try:
+        global eastBump, westBump
+        eastBump = False
+        westBump = False  
+
+        bump_track_dim = in_cm(6.086)
+        tolerance = in_cm(.001)  
         bump_track_bodies = [] 
         
         # Iterate through all bodies in the root component.
@@ -262,16 +266,14 @@ def identifyBump():
             width = boundingBox.maxPoint.y - boundingBox.minPoint.y
             height = boundingBox.maxPoint.z - boundingBox.minPoint.z
             
-            if (abs(length - bump_track_dim_cm) < tolerance_cm) :
+            if (abs(length - bump_track_dim) < tolerance) :
                 # Add the body to the list and rename it
                 bump_track_bodies.append(body)
                 body.name = "Bump"
 
         # Bump stud 6" X 2.5"
-        bump_stud_w_dim_in = 6.0
-        bump_stud_h_dim_in = 2.5
-        bump_stud_w_dim_cm = bump_stud_w_dim_in * 2.54
-        bump_stud_h_dim_cm = bump_stud_h_dim_in * 2.54
+        bump_stud_w_dim = in_cm(6.0)
+        bump_stud_h_dim = in_cm(2.5)
 
         bump_stud_bodies = [] 
 
@@ -281,19 +283,230 @@ def identifyBump():
             length = boundingBox.maxPoint.x - boundingBox.minPoint.x
             width = boundingBox.maxPoint.y - boundingBox.minPoint.y
             
-            if (abs(length - bump_stud_w_dim_cm) < tolerance_cm and
-                abs(width - bump_stud_h_dim_cm) < tolerance_cm):
+            if (abs(length - bump_stud_w_dim) < tolerance and
+                abs(width - bump_stud_h_dim) < tolerance):
                 # Add the body to the list and rename it
                 bump_stud_bodies.append(body)
                 body.name = "Bump"
+
+        # Measure distance from origin to the Bump body
+        bump = next((b for b in rootComp.bRepBodies if b.name == "Bump"), None)
+        if bump:
+            bbox = bump.boundingBox
+            # Measure from the origin (Y=0) to the closest Y point on the body
+            if abs(bbox.minPoint.x) < in_cm(20):
+                eastBump = True
+                bumpEast()
+            else:
+                westBump = True
+                bumpWest()
+            addMessage("A bump has been detected. Adjust toolpaths accordingly.")
     except:
         ui.messageBox(f"identifyBump(): failed:\n{traceback.format_exc()}")
 
+def identifyWindows():      # This function tries to detect if the panel has windows. Goal is to determine to add the window bevel toolpath or not.
+    
+    # Will need to change logic so that it does not pick up small holes or air vents.
+
+    try:
+        target_y = -6.625     # inches
+        tolerance = 0.01      # inches tolerance
+
+        unitsMgr = design.unitsManager
+        target_y_cm = unitsMgr.evaluateExpression(f"{target_y} in", "cm")
+        tol_cm = unitsMgr.evaluateExpression(f"{tolerance} in", "cm")
+
+        for body in rootComp.bRepBodies:
+            if body.name != "Sheathing":
+                continue  # only check the sheathing body
+
+            #ui.messageBox(f'Checking body: {body.name}')
+
+            for face in body.faces:
+                geom = face.geometry
+                if not isinstance(geom, adsk.core.Plane):
+                    continue  # skip non-planar faces
+
+                normal = geom.normal
+                origin = geom.origin
+
+                # ZX plane → normal should be along ±Y
+                if abs(abs(normal.y) - 1.0) > 1e-3:
+                    continue
+
+                # Check for the plane located at Y = -6.625 in (within tolerance)
+                if abs(origin.y - target_y_cm) > tol_cm:
+                    continue
+
+                #ui.messageBox(f'Found ZX face at Y={origin.y:.4f} cm (~{target_y} in)')
+
+                # Detect holes/voids on this face
+                loops = face.loops
+                for loop_index in range(loops.count - 1):
+                    loop = loops.item(loop_index)
+
+                    #ui.messageBox(f'Loop {loop_index} (possible void) edges: {loop.edges.count}')
+
+                    # Gather edge lengths (convert to inches for readability)
+                    edge_lengths_in = [
+                        round(unitsMgr.convert(edge.length, "cm", "in"),3) for edge in loop.edges
+                    ]
+
+                    ui.messageBox(
+                        f"Window(s) detected: {loops.count - 1}\n"
+                        f"Window {loop_index + 1}:\n"
+                        f"Edge lengths (in): {edge_lengths_in}\n"
+                    )
+
+    except:
+        ui.messageBox('identifyWindows() Failed:\n{}'.format(traceback.format_exc()))
+
+def bumpEast():             # This function cuts the "Stock" and "Foam" bodies to prevent the facinghead from cutting the bump.
+    try:
+        # Hide all bodies in the root component
+        for body in rootComp.bRepBodies:
+            body.isVisible = False
+
+        # Show Stock body
+        for body in rootComp.bRepBodies:
+            if body.name == "Stock":
+                body.isVisible = True
+                stock_body = body
+
+        # Sketch on XZ plane (front view)
+        sketches = rootComp.sketches
+        xzPlane = rootComp.xZConstructionPlane
+        sketch = sketches.add(xzPlane)
+
+        # Offset from bump
+        x_offset = 32 #inches
+        x_offset = (x_offset * 2.54 * -1) # convert to CM and change to be negative
+
+        # Draw rectangle in sketch plane coordinates (X = horizontal, Y = vertical)
+        lines = sketch.sketchCurves.sketchLines
+        lines.addTwoPointRectangle(adsk.core.Point3D.create(x_offset, 0, 0),
+                                   adsk.core.Point3D.create(0, 550, 0))
+
+        extrudes = rootComp.features.extrudeFeatures
+        extrudeInput = extrudes.createInput(sketch.profiles[0], adsk.fusion.FeatureOperations.CutFeatureOperation)
+        distance = adsk.core.ValueInput.createByReal(-15 * 2.54)
+        extrudeInput.setDistanceExtent(False, distance)
+        extrudes.add(extrudeInput)
+
+        # Hide Stock body
+        stock_body.isVisible = False
+
+
+        # Cut foam body
+        if foamresult == True:
+            # Show Stock body
+            for body in rootComp.bRepBodies:
+                if body.name == "Foam":
+                    body.isVisible = True
+                    foam_body = body
+
+            # Sketch on XZ plane (front view)
+            sketches = rootComp.sketches
+            xzPlane = rootComp.xZConstructionPlane
+            sketch = sketches.add(xzPlane)
+
+            # Offset from bump
+            x_offset = 8 #inches
+            x_offset = (x_offset * 2.54 * -1) # convert to CM and change to be negative
+
+            # Draw rectangle in sketch plane coordinates (X = horizontal, Y = vertical)
+            lines = sketch.sketchCurves.sketchLines
+            lines.addTwoPointRectangle(adsk.core.Point3D.create(x_offset, 0, 0),
+                                    adsk.core.Point3D.create(0, 550, 0))
+
+            extrudes = rootComp.features.extrudeFeatures
+            extrudeInput = extrudes.createInput(sketch.profiles[0], adsk.fusion.FeatureOperations.CutFeatureOperation)
+            distance = adsk.core.ValueInput.createByReal(-15 * 2.54)
+            extrudeInput.setDistanceExtent(False, distance)
+            extrudes.add(extrudeInput)
+
+            # Hide Foam body
+            foam_body.isVisible = False
+        
+    except:
+        ui.messageBox(f"bumpEast(): failed:\n{traceback.format_exc()}")
+
+def bumpWest():             # This function cuts the "Stock" and "Foam" bodies to prevent the facinghead from cutting the bump.
+    try:
+        # Hide all bodies in the root component
+        for body in rootComp.bRepBodies:
+            body.isVisible = False
+
+        # Hide all bodies in the root component
+        for body in rootComp.bRepBodies:
+            if body.name == "Stock":
+                body.isVisible = True
+                stock_body = body
+
+        # Sketch on XZ plane (front view)
+        sketches = rootComp.sketches
+        xzPlane = rootComp.xZConstructionPlane
+        sketch = sketches.add(xzPlane)
+    
+        # Bounding box of the Stock body
+        bb = stock_body.boundingBox
+        min_x = bb.minPoint.x
+
+        # Offset from bump
+        x_offset = 32 #inches
+        x_offset = (x_offset * 2.54 * -1) # convert to CM and change to be negative
+
+        # Draw rectangle in sketch plane coordinates (X = horizontal, Y = vertical)
+        lines = sketch.sketchCurves.sketchLines
+        lines.addTwoPointRectangle(adsk.core.Point3D.create(min_x, 0, 0),
+                                   adsk.core.Point3D.create((min_x - x_offset), 550, 0))
+
+        extrudes = rootComp.features.extrudeFeatures
+        extrudeInput = extrudes.createInput(sketch.profiles[0], adsk.fusion.FeatureOperations.CutFeatureOperation)
+        distance = adsk.core.ValueInput.createByReal(-15 * 2.54)
+        extrudeInput.setDistanceExtent(False, distance)
+        extrudes.add(extrudeInput)
+
+        stock_body.isVisible = False
+
+        # Cut foam body
+        if foamresult == True:
+            # Show Stock body
+            for body in rootComp.bRepBodies:
+                if body.name == "Foam":
+                    body.isVisible = True
+                    foam_body = body
+
+            # Sketch on XZ plane (front view)
+            sketches = rootComp.sketches
+            xzPlane = rootComp.xZConstructionPlane
+            sketch = sketches.add(xzPlane)
+
+            # Offset from bump
+            x_offset = 8 #inches
+            x_offset = (x_offset * 2.54 * -1) # convert to CM and change to be negative
+
+            # Draw rectangle in sketch plane coordinates (X = horizontal, Y = vertical)
+            lines = sketch.sketchCurves.sketchLines
+            lines.addTwoPointRectangle(adsk.core.Point3D.create(min_x, 0, 0),
+                                   adsk.core.Point3D.create((min_x - x_offset), 550, 0))
+
+            extrudes = rootComp.features.extrudeFeatures
+            extrudeInput = extrudes.createInput(sketch.profiles[0], adsk.fusion.FeatureOperations.CutFeatureOperation)
+            distance = adsk.core.ValueInput.createByReal(-15 * 2.54)
+            extrudeInput.setDistanceExtent(False, distance)
+            extrudes.add(extrudeInput)
+
+            # Hide Foam body
+            foam_body.isVisible = False
+    
+    except:
+        ui.messageBox(f"bumpWest(): failed:\n{traceback.format_exc()}")
+
 def identifyStuds():
     try:
-        stud_dim_in = 6.0
-        stud_dim_cm = stud_dim_in * 2.54
-        tolerance_cm = .001 * 2.54   
+        stud_dim = in_cm(6.0)
+        tolerance = in_cm(.001)
         stud_bodies = [] 
         
         # Iterate through all bodies in the root component.
@@ -301,7 +514,7 @@ def identifyStuds():
             boundingBox = body.boundingBox
             width = boundingBox.maxPoint.y - boundingBox.minPoint.y
             
-            if (abs(width - stud_dim_cm) < tolerance_cm):
+            if (abs(width - stud_dim) < tolerance):
                 # Add the body to the list and rename it
                 stud_bodies.append(body)
                 body.name = "Stud"
@@ -310,9 +523,8 @@ def identifyStuds():
             
 def identifyTrack():
     try:
-        track_dim_in = 6.143
-        track_dim_cm = track_dim_in * 2.54
-        tolerance_cm = .001 * 2.54    
+        track_dim = in_cm(6.143)
+        tolerance = in_cm(.001)
         track_bodies = [] 
         
         # Iterate through all bodies in the root component.
@@ -320,7 +532,7 @@ def identifyTrack():
             boundingBox = body.boundingBox
             width = boundingBox.maxPoint.y - boundingBox.minPoint.y
             
-            if (abs(width - track_dim_cm) < tolerance_cm) :
+            if (abs(width - track_dim) < tolerance) :
                 # Add the body to the list and rename it
                 track_bodies.append(body)
                 body.name = "Track"
@@ -342,8 +554,9 @@ def openBIM():
         ui.messageBox(f"openBIM(): failed:\n{traceback.format_exc()}")
 
 def isReturn():
-    global is_return_result 
+    global is_return_result, west_return 
     is_return_result = adsk.core.DialogResults.DialogNo
+    west_return = False
 
     try:
         studs = [body for body in rootComp.bRepBodies if body.name.startswith("Stud")]
@@ -392,8 +605,7 @@ def isReturn():
         
         exterior_min_point = adsk.core.Point3D.create(min_x, min_y, min_z)
 
-        global west_return
-        west_return = False
+        
         if (abs(exterior_min_point.x / 2.54) - abs(stud_min_point.x / 2.54)) > 4:
             west_return = True
     
@@ -421,17 +633,17 @@ def melvinOrgin():
         # Back-top-right corner
         corner_x, corner_y, corner_z = max_x, max_y, max_z
 
-        # Same X/Z offset as before, but +6" (15.24 cm) added to Y
-        offset_x = corner_x - (0.0625 * 2.54)
-        offset_y = corner_y - (6.0 * 2.54)
-        offset_z = corner_z - (0.0625 * 2.54)
+        # Offsets
+        offset_x = corner_x - in_cm(0.0625)
+        offset_y = corner_y - in_cm(6.0)
+        offset_z = corner_z - in_cm(0.0625)
 
         # Optional alternate X offset if dialog says “Yes”
         if is_return_result == adsk.core.DialogResults.DialogYes:
             if any("Stud" in body.name for body in rootComp.bRepBodies):
                 offset_x = corner_x - (abs(stud_max_point.x))
             else:
-                offset_x = corner_x - (4.6875 * 2.54)
+                offset_x = corner_x - in_cm(4.6875)
 
         construction_point = adsk.core.Point3D.create(offset_x, offset_y, offset_z)
 
@@ -491,8 +703,8 @@ def charlesOrgin():
 
 def mergeSheathin():
     try:
-        sheathing_thickness = 0.625 * 2.54
-        tolerance_cm = 0.01 * 2.54
+        sheathing_thickness = in_cm(0.625)
+        tolerance = in_cm(0.01)
 
         # Keep merging until only one "Sheathing" body remains
         for _ in range(2):  # Run up to twice
@@ -501,7 +713,7 @@ def mergeSheathin():
             for body in rootComp.bRepBodies:
                 boundingBox = body.boundingBox
                 width = boundingBox.maxPoint.y - boundingBox.minPoint.y
-                if abs(width - sheathing_thickness) < tolerance_cm:
+                if abs(width - sheathing_thickness) < tolerance:
                     bodies_to_merge.append(body)
 
             if len(bodies_to_merge) <= 1:
@@ -676,9 +888,7 @@ def melvinSetup():
 
 def charlesSetup():
     try:
-        # Look for body that is 3" thick 
-        global foamresult
-        foamresult = False
+        
         
         # Checks for total thickness of panel. Could get false positive for panels with bumps but not foam.
         for body in rootComp.bRepBodies:
@@ -693,9 +903,7 @@ def charlesSetup():
                 if width > (6.9):
                     foamresult = True
 
-        # Checks for body named "Foam"        
-        if any("Foam" in body.name for body in rootComp.bRepBodies):
-            foamresult = True
+        
 
         #if foamresult == True:
         if foamresult == True:
@@ -788,10 +996,8 @@ def charlesSetup():
             
             template_names_to_load = []
             # Load templates from cloud for Charles
-            if not any(body.name == "Bump" for body in rootComp.bRepBodies):
-                template_names_to_load.append("Charles Facinghead")
-            
             template_names_to_load.extend([
+                    "Charles Facinghead",
                     "Charles Perimeter",
                     "Charles Perimeter Above Sheathing"
             ])
@@ -831,8 +1037,33 @@ def charlesSetup():
                 setup.createFromCAMTemplate(found_template)
         else:
             addMessage("\"Foam\" body could not be found: The Charles setup will not be created.")
+
+        if any("Bump" in body.name for body in rootComp.bRepBodies):
+            bumpMod()
     except:
         ui.messageBox(f"charlesSetup(): failed:\n{traceback.format_exc()}")
+
+def bumpMod():              # This function modifies the Facinghead toolpath if a bump is decected
+    try:
+        for body in rootComp.bRepBodies:
+            # Check if the body's name is "sheathing" (case-sensitive)
+            if body.name.startswith("Bump"):
+                body.isVisible = True
+
+        if eastBump == True:
+            facinghead_input = setup.operations.itemByName('Facinghead')
+            facinghead_input.parameters.itemByName('passAngle').expression = '0 deg'
+            facinghead_input.parameters.itemByName('transitionType').expression = "'straight-line'"
+            cam.generateToolpath(facinghead_input)
+        elif westBump == True:
+            facinghead_input = setup.operations.itemByName('Facinghead')
+            facinghead_input.parameters.itemByName('passAngle').expression = '180 deg'
+            facinghead_input.parameters.itemByName('transitionType').expression = "'straight-line'"
+            cam.generateToolpath(facinghead_input)
+        else:
+            None
+    except:
+        ui.messageBox(f"bumpMod(): failed:\n{traceback.format_exc()}")
 
 def thinFoam():
     try:
@@ -920,9 +1151,11 @@ def foamErrorDetection():
                     message += "\n".join(alert_messages)
                     #ui.messageBox(message, 'Dimension Alert')
                 else:
-                    message = "The dimension difference between 'Foam' and 'Sheathing' is 1 inch or more in all directions.\n"
-                    message += f"X difference: {diffLength:.3f} inches\n"
-                    message += f"Z difference: {diffHeight:.3f} inches"
+                    message = "\u2022 Difference between the 'Foam' and 'Sheathing' has been deteceted:\n"
+                    if diffLength > 0.003:
+                        message += f"       \u2022 X axis: {diffLength:.3f} inches"
+                    if diffHeight > 0.003:
+                        message += f"       \u2022 Z axis: {diffHeight:.3f} inches"
                     #ui.messageBox(message, 'Dimension Alert')
                 report_message.append(message)
     except:
@@ -930,14 +1163,13 @@ def foamErrorDetection():
 
 def showAllMessages():
     try:
-        full_message = "\n".join(report_message)  # join all messages with line breaks
+        if len(report_message) == 0:
+            addMessage("Everything looks great!")
+
+        full_message = "\n".join(report_message)
         ui.messageBox(full_message, "Script Summary", 
                     adsk.core.MessageBoxButtonTypes.OKButtonType,
                     adsk.core.MessageBoxIconTypes.InformationIconType)
     except:
-        ui.showAllMessages(f"showAllMessages(): failed:\n{traceback.format_exc()}")
-
-def addMessage(msg):
-    global report_message 
-    report_message.append(f"\u2022 {msg}\n")
-    
+        ui.messageBox(f"showAllMessages(): failed:\n{traceback.format_exc()}")
+ 
